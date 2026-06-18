@@ -19,6 +19,30 @@ async function releaseLock(redis, lockKey) {
     await redis.del(lockKey);
 }
 
+async function tokenBucketAllowed(redis, clientId) {
+    const bucketKey = `bucket:${clientId}`;
+    const capacity = 6;
+    const refillRate = 1; 
+    const now = Math.floor(Date.now() / 1000); 
+    
+    const bucketData = await redis.get(bucketKey);
+    let bucket = bucketData ? JSON.parse(bucketData) : { tokens: capacity, lastRefillAt: now };
+    
+
+    const secondsElapsed = now - bucket.lastRefillAt;
+    const tokensToAdd = secondsElapsed * refillRate;
+    bucket.tokens = Math.min(capacity, bucket.tokens + tokensToAdd);
+    bucket.lastRefillAt = now;
+    
+    if (bucket.tokens >= 1) {
+      bucket.tokens -= 1; 
+      await redis.set(bucketKey, JSON.stringify(bucket), 'EX', 3600); 
+      return { allowed: true, tokensRemaining: Math.floor(bucket.tokens) };
+    }
+    
+    return { allowed: false, tokensRemaining: 0 };
+}
+
 const ring=new  consistentHashRing()
 ring.addNode('NodeA')
 ring.addNode('NodeB')
@@ -27,13 +51,9 @@ ring.addNode('NodeC')
 app.get('/api/resource', async(req,res)=>{
     const clientId= req.headers['x-client-id'] || req.ip
     const nodeName= ring.getNode(clientId)
-    console.log('DEBUG nodeName:', nodeName, typeof nodeName)
-console.log('DEBUG redisNodes keys:', Object.keys(redisNodes))
-
 
     const redis= redisNodes[nodeName]
     const lockKey= `lock:${clientId}`
-    const rateKey=  `ratelimit:${clientId}`
 
     const gotLock= await acquireLock(redis,lockKey)
 
@@ -42,18 +62,20 @@ console.log('DEBUG redisNodes keys:', Object.keys(redisNodes))
     }
 
     try { 
-    let requests= await redis.get(rateKey)
-    requests= requests ? parseInt(requests) : 0;
-
-    if(requests >= 5){
-        return res.status(429).json({error : "too many requests", node: nodeName})
-    }
-
-    await redis.incr(rateKey)
-    await redis.expire(rateKey,60)
-
-
-    res.json({message : "request successful", requests: requests+1, node: nodeName })
+        const bucketResult= await tokenBucketAllowed(redis,clientId)
+        
+        if(!bucketResult){  
+            return res.status(429).json({
+                error: 'Too many requests',
+                tokensRemaining: 0,
+                node: nodeName
+            });
+        }
+     console.log(bucketResult.tokensRemaining)
+     res.json({ message : "request successful", 
+                tokensRemaining: bucketResult.tokensRemaining, 
+                node: nodeName 
+            });
     }
     finally{
         await releaseLock(redis,lockKey)
